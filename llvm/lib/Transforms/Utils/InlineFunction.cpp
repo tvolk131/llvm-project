@@ -1233,11 +1233,6 @@ static void AddAliasScopeMetadata(CallBase &CB, ValueToValueMapTy &VMap,
   if (NoAliasArgs.empty())
     return;
 
-  // To do a good job, if a noalias variable is captured, we need to know if
-  // the capture point dominates the particular use we're considering.
-  DominatorTree DT;
-  DT.recalculate(const_cast<Function&>(*CalledFunc));
-
   // noalias indicates that pointer values based on the argument do not alias
   // pointer values which are not based on it. So we add a new "scope" for each
   // noalias function argument. Accesses using pointers based on that argument
@@ -1281,6 +1276,23 @@ static void AddAliasScopeMetadata(CallBase &CB, ValueToValueMapTy &VMap,
       (void)NoAliasDecl;
     }
   }
+
+  // To do a good job, if a noalias variable is captured, we need to know if
+  // the capture point dominates the particular use we're considering.
+  // Compute DominatorTree lazily only if a noalias argument may actually be
+  // captured and a memory access requires a before-capture check.
+  std::optional<DominatorTree> LazyDT;
+  auto GetDT = [&]() -> const DominatorTree & {
+    if (!LazyDT) {
+      LazyDT.emplace();
+      LazyDT->recalculate(const_cast<Function &>(*CalledFunc));
+    }
+    return *LazyDT;
+  };
+
+  // Cache per-argument whole-function provenance capture status (ignoring
+  // returns).
+  SmallVector<std::optional<bool>, 4> ArgMayBeCaptured(NoAliasArgs.size());
 
   // Iterate over all new instructions in the map; for all memory-access
   // instructions, add the alias scope metadata.
@@ -1439,7 +1451,7 @@ static void AddAliasScopeMetadata(CallBase &CB, ValueToValueMapTy &VMap,
       // An arbitrary function that might load pointers could see captured
       // noalias arguments via other noalias arguments or globals, and so we
       // must always check for prior capture.
-      for (const Argument *A : NoAliasArgs) {
+      for (auto [Idx, A] : enumerate(NoAliasArgs)) {
         if (ObjSet.contains(A))
           continue; // May be based on a noalias argument.
 
@@ -1447,10 +1459,22 @@ static void AddAliasScopeMetadata(CallBase &CB, ValueToValueMapTy &VMap,
         // A->hasNoCaptureAttr() is true, but this is incorrect because
         // nocapture only guarantees that no copies outlive the function, not
         // that the value cannot be locally captured.
-        if (!RequiresNoCaptureBefore ||
-            !capturesAnything(PointerMayBeCapturedBefore(
-                A, /*ReturnCaptures=*/false, I, &DT, /*IncludeI=*/false,
-                CaptureComponents::Provenance)))
+        bool CapturedBefore = false;
+        if (RequiresNoCaptureBefore) {
+          // PointerMayBeCapturedBefore explores a subset of the uses visited
+          // by PointerMayBeCaptured, so if A is never captured (ignoring
+          // returns) anywhere in CalledFunc, it cannot be captured before I.
+          if (!ArgMayBeCaptured[Idx]) {
+            CaptureResult Res =
+                PointerMayBeCaptured(A, CaptureComponents::Provenance);
+            ArgMayBeCaptured[Idx] = capturesAnything(Res.WithoutRet);
+          }
+          if (*ArgMayBeCaptured[Idx])
+            CapturedBefore = capturesAnything(PointerMayBeCapturedBefore(
+                A, /*ReturnCaptures=*/false, I, &GetDT(), /*IncludeI=*/false,
+                CaptureComponents::Provenance));
+        }
+        if (!CapturedBefore)
           NoAliases.push_back(NewScopes[A]);
       }
 
