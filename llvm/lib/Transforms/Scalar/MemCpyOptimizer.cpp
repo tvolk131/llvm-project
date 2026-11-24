@@ -1794,7 +1794,8 @@ static bool isZeroSize(Value *Size) {
 /// B to be a memcpy from X to Z (or potentially a memmove, depending on
 /// circumstances). This allows later passes to remove the first memcpy
 /// altogether.
-bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI) {
+bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI,
+                                  bool SeenMemSetInBB) {
   // We can only optimize non-volatile memcpy's.
   if (M->isVolatile())
     return false;
@@ -1839,19 +1840,23 @@ bool MemCpyOptPass::processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI) {
   BatchAAResults BAA(*AA, EEA);
   // FIXME: Not using getClobberingMemoryAccess() here due to PR54682.
   MemoryAccess *AnyClobber = MA->getDefiningAccess();
-  MemoryLocation DestLoc = MemoryLocation::getForDest(M);
-  const MemoryAccess *DestClobber =
-      MSSA->getWalker()->getClobberingMemoryAccess(AnyClobber, DestLoc, BAA);
-
   // Try to turn a partially redundant memset + memcpy into
   // smaller memset + memcpy.  We don't need the memcpy size for this.
   // The memcpy must post-dom the memset, so limit this to the same basic
   // block. A non-local generalization is likely not worthwhile.
-  if (auto *MD = dyn_cast<MemoryDef>(DestClobber))
-    if (auto *MDep = dyn_cast_or_null<MemSetInst>(MD->getMemoryInst()))
-      if (DestClobber->getBlock() == M->getParent())
-        if (processMemSetMemCpyDependence(M, MDep, BAA))
-          return true;
+  // Skip the DestClobber walk unless a memset has been seen in this block
+  // and AnyClobber is a MemoryDef in the same block.
+  if (SeenMemSetInBB && isa<MemoryDef>(AnyClobber) &&
+      AnyClobber->getBlock() == M->getParent()) {
+    MemoryLocation DestLoc = MemoryLocation::getForDest(M);
+    const MemoryAccess *DestClobber =
+        MSSA->getWalker()->getClobberingMemoryAccess(AnyClobber, DestLoc, BAA);
+    if (auto *MD = dyn_cast<MemoryDef>(DestClobber))
+      if (auto *MDep = dyn_cast_or_null<MemSetInst>(MD->getMemoryInst()))
+        if (DestClobber->getBlock() == M->getParent())
+          if (processMemSetMemCpyDependence(M, MDep, BAA))
+            return true;
+  }
 
   MemoryAccess *SrcClobber = MSSA->getWalker()->getClobberingMemoryAccess(
       AnyClobber, MemoryLocation::getForSource(M), BAA);
@@ -2194,6 +2199,12 @@ bool MemCpyOptPass::iterateOnFunction(Function &F) {
     if (!DT->isReachableFromEntry(&BB))
       continue;
 
+    // True once any MemSetInst in BB has been visited. Every transform that
+    // inserts or skips over a MemSetInst leaves BI at or before a MemSetInst,
+    // so this is true whenever a memset precedes the current instruction.
+    // (If a future transform inserted a memset without resetting BI, it would
+    // only miss the memset+memcpy optimization, not miscompile.)
+    bool SeenMemSetInBB = false;
     for (BasicBlock::iterator BI = BB.begin(), BE = BB.end(); BI != BE;) {
       // Avoid invalidating the iterator.
       Instruction *I = &*BI++;
@@ -2202,10 +2213,11 @@ bool MemCpyOptPass::iterateOnFunction(Function &F) {
 
       if (auto *SI = dyn_cast<StoreInst>(I))
         MadeChange |= processStore(SI, BI);
-      else if (auto *M = dyn_cast<MemSetInst>(I))
+      else if (auto *M = dyn_cast<MemSetInst>(I)) {
+        SeenMemSetInBB = true;
         RepeatInstruction = processMemSet(M, BI);
-      else if (auto *M = dyn_cast<MemCpyInst>(I))
-        RepeatInstruction = processMemCpy(M, BI);
+      } else if (auto *M = dyn_cast<MemCpyInst>(I))
+        RepeatInstruction = processMemCpy(M, BI, SeenMemSetInBB);
       else if (auto *M = dyn_cast<MemMoveInst>(I))
         RepeatInstruction = processMemMove(M, BI);
       else if (auto *CB = dyn_cast<CallBase>(I)) {

@@ -66,7 +66,8 @@ private:
   bool processStoreOfLoad(StoreInst *SI, LoadInst *LI, const DataLayout &DL,
                           BasicBlock::iterator &BBI);
   bool processMemSet(MemSetInst *SI, BasicBlock::iterator &BBI);
-  bool processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI);
+  bool processMemCpy(MemCpyInst *M, BasicBlock::iterator &BBI,
+                     bool SeenMemSetInBB);
   bool processMemMove(MemMoveInst *M, BasicBlock::iterator &BBI);
   bool performCallSlotOptzn(Instruction *cpyLoad, Instruction *cpyStore,
                             Value *cpyDst, Value *cpySrc, TypeSize cpyLen,
