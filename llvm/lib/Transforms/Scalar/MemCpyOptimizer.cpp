@@ -2092,14 +2092,33 @@ bool MemCpyOptPass::processByValArgument(CallBase &CB, unsigned ArgNo) {
 /// 4. The memcpy src is not modified during the call. (ModRef check shows no
 /// Mod.)
 bool MemCpyOptPass::processImmutArgument(CallBase &CB, unsigned ArgNo) {
-  BatchAAResults BAA(*AA, EEA);
   Value *ImmutArg = CB.getArgOperand(ArgNo);
 
-  // 1. Ensure passed argument is immutable during call.
+  // 1. Ensure passed argument is immutable during call (cheap attribute check).
   if (!CB.doesNotCapture(ArgNo))
     return false;
 
-  // We know that the argument is readonly at this point, but the function
+  // 2. Check that arg is a fixed-size alloca and CB has a MemorySSA access
+  // before running the more expensive AA ModRef query for step 1.
+  // TODO: Even if the arg gets back to branches, we can remove memcpy if all
+  // the alloca alignments can be enforced to source alignment.
+  auto *AI = dyn_cast<AllocaInst>(ImmutArg->stripPointerCasts());
+  if (!AI)
+    return false;
+
+  const DataLayout &DL = CB.getDataLayout();
+  std::optional<TypeSize> AllocaSize = AI->getAllocationSize(DL);
+  // Can't handle unknown size alloca.
+  // (e.g. Variable Length Array, Scalable Vector)
+  if (!AllocaSize || AllocaSize->isScalable())
+    return false;
+
+  MemoryUseOrDef *CallAccess = MSSA->getMemoryAccess(&CB);
+  if (!CallAccess)
+    return false;
+
+  BatchAAResults BAA(*AA, EEA);
+  // Complete step 1: the argument is readonly at this point, but the function
   // might still modify the same memory through a different pointer. Exclude
   // this either via noalias, or alias analysis.
   if (!CB.paramHasAttr(ArgNo, Attribute::NoAlias) &&
@@ -2107,24 +2126,7 @@ bool MemCpyOptPass::processImmutArgument(CallBase &CB, unsigned ArgNo) {
           BAA.getModRefInfo(&CB, MemoryLocation::getBeforeOrAfter(ImmutArg))))
     return false;
 
-  const DataLayout &DL = CB.getDataLayout();
-
-  // 2. Check that arg is alloca
-  // TODO: Even if the arg gets back to branches, we can remove memcpy if all
-  // the alloca alignments can be enforced to source alignment.
-  auto *AI = dyn_cast<AllocaInst>(ImmutArg->stripPointerCasts());
-  if (!AI)
-    return false;
-
-  std::optional<TypeSize> AllocaSize = AI->getAllocationSize(DL);
-  // Can't handle unknown size alloca.
-  // (e.g. Variable Length Array, Scalable Vector)
-  if (!AllocaSize || AllocaSize->isScalable())
-    return false;
   MemoryLocation Loc(ImmutArg, LocationSize::precise(*AllocaSize));
-  MemoryUseOrDef *CallAccess = MSSA->getMemoryAccess(&CB);
-  if (!CallAccess)
-    return false;
 
   MemCpyInst *MDep = nullptr;
   MemoryAccess *Clobber = MSSA->getWalker()->getClobberingMemoryAccess(
