@@ -1244,7 +1244,8 @@ static void AddAliasScopeMetadata(CallBase &CB, ValueToValueMapTy &VMap,
   // become part of that alias scope, accesses using pointers not based on that
   // argument are tagged as noalias with that scope.
 
-  DenseMap<const Argument *, MDNode *> NewScopes;
+  SmallVector<MDNode *, 4> NewScopes;
+  NewScopes.reserve(NoAliasArgs.size());
   MDBuilder MDB(CalledFunc->getContext());
 
   // Create a new scope domain for this function. Its scopes are disjoint,
@@ -1268,7 +1269,7 @@ static void AddAliasScopeMetadata(CallBase &CB, ValueToValueMapTy &VMap,
     // of the linkage of the callee because the aliasing "scope" is not just a
     // property of the callee, but also all control dependencies in the caller.
     MDNode *NewScope = MDB.createAnonymousAliasScope(NewDomain, Name);
-    NewScopes.insert(std::make_pair(A, NewScope));
+    NewScopes.push_back(NewScope);
 
     if (UseNoAliasIntrinsic) {
       // Introduce a llvm.experimental.noalias.scope.decl for the noalias
@@ -1416,9 +1417,9 @@ static void AddAliasScopeMetadata(CallBase &CB, ValueToValueMapTy &VMap,
       // non-parameter pointer-values.
       bool CanAddScopes = !UsesAliasingPtr && (!IsFuncCall || IsArgMemOnlyCall);
       if (CanAddScopes) {
-        for (const Argument *A : NoAliasArgs) {
+        for (auto [A, Scope] : zip_equal(NoAliasArgs, NewScopes)) {
           if (ObjSet.count(A))
-            Scopes.push_back(NewScopes[A]);
+            Scopes.push_back(Scope);
         }
       }
 
@@ -1439,7 +1440,7 @@ static void AddAliasScopeMetadata(CallBase &CB, ValueToValueMapTy &VMap,
       // An arbitrary function that might load pointers could see captured
       // noalias arguments via other noalias arguments or globals, and so we
       // must always check for prior capture.
-      for (const Argument *A : NoAliasArgs) {
+      for (auto [A, Scope] : zip_equal(NoAliasArgs, NewScopes)) {
         if (ObjSet.contains(A))
           continue; // May be based on a noalias argument.
 
@@ -1451,7 +1452,7 @@ static void AddAliasScopeMetadata(CallBase &CB, ValueToValueMapTy &VMap,
             !capturesAnything(PointerMayBeCapturedBefore(
                 A, /*ReturnCaptures=*/false, I, &DT, /*IncludeI=*/false,
                 CaptureComponents::Provenance)))
-          NoAliases.push_back(NewScopes[A]);
+          NoAliases.push_back(Scope);
       }
 
       if (!NoAliases.empty())
