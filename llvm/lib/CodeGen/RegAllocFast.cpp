@@ -649,12 +649,15 @@ void RegAllocFastImpl::spill(MachineBasicBlock::iterator Before,
   TII->storeRegToStackSlot(*MBB, Before, AssignedReg, Kill, FI, &RC, VirtReg);
   ++NumStores;
 
-  MachineBasicBlock::iterator FirstTerm = MBB->getFirstTerminator();
-
   // When we spill a virtual register, we will have spill instructions behind
   // every definition of it, meaning we can switch all the DBG_VALUEs over
   // to just reference the stack slot.
-  SmallVectorImpl<MachineOperand *> &LRIDbgOperands = LiveDbgValueMap[VirtReg];
+  auto DbgIt = LiveDbgValueMap.find(VirtReg);
+  if (DbgIt == LiveDbgValueMap.end() || DbgIt->second.empty())
+    return;
+
+  MachineBasicBlock::iterator FirstTerm = MBB->getFirstTerminator();
+  SmallVectorImpl<MachineOperand *> &LRIDbgOperands = DbgIt->second;
   SmallMapVector<MachineInstr *, SmallVector<const MachineOperand *>, 2>
       SpilledOperandsMap;
   for (MachineOperand *MO : LRIDbgOperands)
@@ -1951,6 +1954,9 @@ void RegAllocFastImpl::handleBundle(MachineInstr &MI) {
 }
 
 void RegAllocFastImpl::allocateBasicBlock(MachineBasicBlock &MBB) {
+  if (MBB.empty())
+    return;
+
   this->MBB = &MBB;
   LLVM_DEBUG(dbgs() << "\nAllocating " << MBB);
 
@@ -1973,6 +1979,17 @@ void RegAllocFastImpl::allocateBasicBlock(MachineBasicBlock &MBB) {
     // affect codegen of the other instructions in any way.
     if (MI.isDebugValue()) {
       handleDebugValue(MI);
+      continue;
+    }
+
+    // Labels, CFI instructions, and DBG_LABEL carry no register or regmask
+    // operands, so skip allocateInstruction() setup.
+    if (MI.isPosition() || MI.isDebugLabel()) {
+      assert(llvm::none_of(MI.operands(),
+                           [](const MachineOperand &MO) {
+                             return MO.isReg() || MO.isRegMask();
+                           }) &&
+             "Position/DBG_LABEL instruction unexpectedly has reg/regmask op");
       continue;
     }
 
