@@ -428,6 +428,9 @@ private:
   /// \returns true if any markers were removed.
   bool removeAllMarkers();
 
+  /// Collect reachable lifetime start/end markers in depth-first order.
+  void collectReachableMarkers();
+
   /// Scan the machine function and find all of the lifetime markers.
   /// Record the findings in the BEGIN and END vectors.
   /// \returns the number of markers found.
@@ -600,6 +603,17 @@ bool StackColoring::isLifetimeStartOrEnd(const MachineInstr &MI,
     }
   }
   return false;
+}
+
+void StackColoring::collectReachableMarkers() {
+  for (MachineBasicBlock *MBB : depth_first(MF)) {
+    for (MachineInstr &MI : *MBB) {
+      if ((MI.getOpcode() == TargetOpcode::LIFETIME_START ||
+           MI.getOpcode() == TargetOpcode::LIFETIME_END) &&
+          getStartOrEndSlot(MI) >= 0)
+        Markers.push_back(&MI);
+    }
+  }
 }
 
 unsigned StackColoring::collectMarkers(unsigned NumSlot) {
@@ -1195,34 +1209,40 @@ bool StackColoring::run(MachineFunction &Func, bool OnlyRemoveMarkers) {
   if (!NumSlots)
     return false;
 
+  int64_t TotalSize = 0;
+  for (int i = 0; i < MFI->getObjectIndexEnd(); ++i)
+    TotalSize += MFI->getObjectSize(i);
+
+  // If we will not try to merge slots, just collect and remove reachable
+  // lifetime markers without building liveness bitvectors.
+  if (TotalSize < 16 || !Opts.stack_coloring || OnlyRemoveMarkers) {
+    collectReachableMarkers();
+    NumMarkerSeen += Markers.size();
+    LLVM_DEBUG(dbgs() << "Will not try to merge slots.\n");
+    return removeAllMarkers();
+  }
+
+  unsigned NumMarkers = collectMarkers(NumSlots);
+
+  LLVM_DEBUG(dbgs() << "Found " << NumMarkers << " markers and " << NumSlots
+                    << " slots\n");
+  LLVM_DEBUG(dbgs() << "Slot structure:\n");
+  LLVM_DEBUG({
+    for (int i = 0; i < MFI->getObjectIndexEnd(); ++i)
+      dbgs() << "Slot #" << i << " - " << MFI->getObjectSize(i) << " bytes.\n";
+    dbgs() << "Total Stack size: " << TotalSize << " bytes\n\n";
+  });
+
+  // Don't continue because there are not enough lifetime markers.
+  if (NumMarkers < 2) {
+    LLVM_DEBUG(dbgs() << "Will not try to merge slots.\n");
+    return removeAllMarkers();
+  }
+
   SmallVector<int, 8> SortedSlots;
   SortedSlots.reserve(NumSlots);
   Intervals.reserve(NumSlots);
   LiveStarts.resize(NumSlots);
-
-  unsigned NumMarkers = collectMarkers(NumSlots);
-
-  int64_t TotalSize = 0;
-  LLVM_DEBUG(dbgs() << "Found " << NumMarkers << " markers and " << NumSlots
-                    << " slots\n");
-  LLVM_DEBUG(dbgs() << "Slot structure:\n");
-
-  for (int i=0; i < MFI->getObjectIndexEnd(); ++i) {
-    LLVM_DEBUG(dbgs() << "Slot #" << i << " - " << MFI->getObjectSize(i)
-                      << " bytes.\n");
-    TotalSize += MFI->getObjectSize(i);
-  }
-
-  LLVM_DEBUG(dbgs() << "Total Stack size: " << TotalSize << " bytes\n\n");
-
-  // Don't continue because there are not enough lifetime markers, or the
-  // stack is too small, or we are told not to optimize the slots, or
-  // opt-bisect-limit is skipping this pass.
-  if (NumMarkers < 2 || TotalSize < 16 || !Opts.stack_coloring ||
-      OnlyRemoveMarkers) {
-    LLVM_DEBUG(dbgs() << "Will not try to merge slots.\n");
-    return removeAllMarkers();
-  }
 
   for (unsigned i=0; i < NumSlots; ++i) {
     std::unique_ptr<LiveInterval> LI(new LiveInterval(i, 0));
