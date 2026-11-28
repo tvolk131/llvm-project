@@ -39,6 +39,7 @@
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Use.h"
 #include "llvm/IR/Value.h"
@@ -92,6 +93,16 @@ class AggressiveDeadCodeElimination {
 
   /// Mapping of blocks to associated information, indexed by block number.
   SmallVector<BlockInfoType> BlockInfo;
+
+  /// Total number of instructions in F when ADCE starts.
+  size_t NumInsts = 0;
+
+  /// Cached value-profiling runtime function in the module (if declared).
+  const Function *ValueProfFn = nullptr;
+
+  /// True if any instruction in F has attached DbgRecords.
+  /// ADCE never creates DbgRecords, so this stays false if initially false.
+  bool HasDbgRecords = false;
 
   /// Set of live instructions.
   SmallPtrSet<Instruction *, 32> LiveInst;
@@ -180,9 +191,11 @@ ADCEChanged AggressiveDeadCodeElimination::performDeadCodeElimination() {
 
 void AggressiveDeadCodeElimination::initialize() {
   BlockInfo.resize(F.getMaxBlockNumber());
-  size_t NumInsts = 0;
-  for (auto &BB : F)
-    NumInsts += BB.size();
+  ValueProfFn = F.getParent()->getFunction(getInstrProfValueProfFuncName());
+  for (Instruction &I : instructions(F)) {
+    ++NumInsts;
+    HasDbgRecords |= I.hasDbgRecords();
+  }
   LiveInst.reserve(NumInsts);
 
   // Collect the set of "root" instructions that are known live.
@@ -253,11 +266,12 @@ bool AggressiveDeadCodeElimination::isAlwaysLive(Instruction &I) {
 // if it's instrumenting a constant.
 bool AggressiveDeadCodeElimination::isInstrumentsConstant(Instruction &I) {
   // TODO -- move this test into llvm::isInstructionTriviallyDead
+  if (!ValueProfFn)
+    return false;
   if (CallInst *CI = dyn_cast<CallInst>(&I))
-    if (Function *Callee = CI->getCalledFunction())
-      if (Callee->getName() == getInstrProfValueProfFuncName())
-        if (isa<Constant>(CI->getArgOperand(0)))
-          return true;
+    if (CI->getCalledFunction() == ValueProfFn)
+      if (isa<Constant>(CI->getArgOperand(0)))
+        return true;
   return false;
 }
 
@@ -294,8 +308,9 @@ void AggressiveDeadCodeElimination::markLive(Instruction *I) {
   Worklist.push_back(I);
 
   // Collect the live debug info scopes attached to this instruction.
-  if (const DILocation *DL = I->getDebugLoc())
-    collectLiveScopes(*DL);
+  if (HasDbgRecords)
+    if (const DILocation *DL = I->getDebugLoc())
+      collectLiveScopes(*DL);
 
   // Mark the containing block live
   BasicBlock *BB = I->getParent();
@@ -412,6 +427,12 @@ void AggressiveDeadCodeElimination::markLiveBranchesFromControlDependences() {
 //
 //===----------------------------------------------------------------------===//
 ADCEChanged AggressiveDeadCodeElimination::removeDeadInstructions() {
+  if (!HasDbgRecords && LiveInst.size() == NumInsts) {
+    assert(BlocksWithDeadTerminators.empty() &&
+           "All instructions are live so no terminator can be dead");
+    return {};
+  }
+
   ADCEChanged Changed;
   // Updates control and dataflow around dead blocks
   Changed.ChangedControlFlow = updateDeadRegions();
@@ -559,8 +580,9 @@ void AggressiveDeadCodeElimination::makeUnconditional(BasicBlock *BB,
                                                       BasicBlock *Target) {
   Instruction *PredTerm = BB->getTerminator();
   // Collect the live debug info scopes attached to this instruction.
-  if (const DILocation *DL = PredTerm->getDebugLoc())
-    collectLiveScopes(*DL);
+  if (HasDbgRecords)
+    if (const DILocation *DL = PredTerm->getDebugLoc())
+      collectLiveScopes(*DL);
 
   // Just mark live an existing unconditional branch
   if (auto *BI = dyn_cast<UncondBrInst>(PredTerm)) {
