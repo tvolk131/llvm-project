@@ -192,10 +192,12 @@ private:
 
 void GlobalsAAResult::DeletionCallbackHandle::deleted() {
   Value *V = getValPtr();
-  if (auto *F = dyn_cast<Function>(V))
+  // Callback handles are only created for Functions, GlobalVariables, and
+  // noalias allocation calls.
+  if (auto *F = dyn_cast<Function>(V)) {
     GAR->FunctionInfos.erase(F);
-
-  if (GlobalValue *GV = dyn_cast<GlobalValue>(V)) {
+    GAR->NonAddressTakenGlobals.erase(F);
+  } else if (auto *GV = dyn_cast<GlobalVariable>(V)) {
     if (GAR->NonAddressTakenGlobals.erase(GV)) {
       // This global might be an indirect global.  If so, remove it and
       // remove any AllocRelatedValues for it.
@@ -210,10 +212,12 @@ void GlobalsAAResult::DeletionCallbackHandle::deleted() {
       for (auto &FIPair : GAR->FunctionInfos)
         FIPair.second.eraseModRefInfoForGlobal(*GV);
     }
+  } else {
+    // If this is an allocation related to an indirect global, remove it.
+    assert(isa<CallBase>(V) &&
+           "Expected Function, GlobalVariable, or allocation CallBase");
+    GAR->AllocsForIndirectGlobals.erase(V);
   }
-
-  // If this is an allocation related to an indirect global, remove it.
-  GAR->AllocsForIndirectGlobals.erase(V);
 
   // And clear out the handle.
   setValPtr(nullptr);
