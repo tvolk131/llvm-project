@@ -809,27 +809,28 @@ void StackColoring::calculateLocalLiveness() {
 }
 
 void StackColoring::calculateLiveIntervals(unsigned NumSlots) {
-  SmallVector<SlotIndex, 16> Starts;
-  SmallVector<bool, 16> DefinitelyInUse;
+  SmallVector<SlotIndex, 16> Starts(NumSlots);
+  SmallVector<bool, 16> DefinitelyInUse(NumSlots, false);
+  // Tracks slots touched in the current block for O(touched) cleanup.
+  // May contain duplicates; subsequent visits see an already-cleared SlotIndex.
+  SmallVector<unsigned, 16> TouchedSlots;
+  SmallVector<int, 4> slots;
 
   // For each block, find which slots are active within this block
   // and update the live intervals.
   for (const MachineBasicBlock &MBB : *MF) {
-    Starts.clear();
-    Starts.resize(NumSlots);
-    DefinitelyInUse.clear();
-    DefinitelyInUse.resize(NumSlots);
-
     // Start the interval of the slots that we previously found to be 'in-use'.
     BlockLifetimeInfo &MBBLiveness = BlockLiveness[&MBB];
+    SlotIndex StartIdx = Indexes->getMBBStartIdx(&MBB);
     for (int pos = MBBLiveness.LiveIn.find_first(); pos != -1;
          pos = MBBLiveness.LiveIn.find_next(pos)) {
-      Starts[pos] = Indexes->getMBBStartIdx(&MBB);
+      Starts[pos] = StartIdx;
+      TouchedSlots.push_back(pos);
     }
 
     // Create the interval for the basic blocks containing lifetime begin/end.
     for (const MachineInstr &MI : MBB) {
-      SmallVector<int, 4> slots;
+      slots.clear();
       bool IsStart = false;
       if (!isLifetimeStartOrEnd(MI, slots, IsStart))
         continue;
@@ -839,12 +840,14 @@ void StackColoring::calculateLiveIntervals(unsigned NumSlots) {
           // If a slot is already definitely in use, we don't have to emit
           // a new start marker because there is already a pre-existing
           // one.
+          if (!Starts[Slot].isValid()) {
+            Starts[Slot] = ThisIndex;
+            TouchedSlots.push_back(Slot);
+          }
           if (!DefinitelyInUse[Slot]) {
             LiveStarts[Slot].push_back(ThisIndex);
             DefinitelyInUse[Slot] = true;
           }
-          if (!Starts[Slot].isValid())
-            Starts[Slot] = ThisIndex;
         } else {
           if (Starts[Slot].isValid()) {
             VNInfo *VNI = Intervals[Slot]->getValNumInfo(0);
@@ -857,14 +860,19 @@ void StackColoring::calculateLiveIntervals(unsigned NumSlots) {
       }
     }
 
-    // Finish up started segments
-    for (unsigned i = 0; i < NumSlots; ++i) {
-      if (!Starts[i].isValid())
-        continue;
-
+    // Finish up started segments and reset only touched slots.
+    if (!TouchedSlots.empty()) {
       SlotIndex EndIdx = Indexes->getMBBEndIdx(&MBB);
-      VNInfo *VNI = Intervals[i]->getValNumInfo(0);
-      Intervals[i]->addSegment(LiveInterval::Segment(Starts[i], EndIdx, VNI));
+      for (unsigned i : TouchedSlots) {
+        if (Starts[i].isValid()) {
+          VNInfo *VNI = Intervals[i]->getValNumInfo(0);
+          Intervals[i]->addSegment(
+              LiveInterval::Segment(Starts[i], EndIdx, VNI));
+          Starts[i] = SlotIndex();
+        }
+        DefinitelyInUse[i] = false;
+      }
+      TouchedSlots.clear();
     }
   }
 }
@@ -1274,64 +1282,67 @@ bool StackColoring::run(MachineFunction &Func, bool OnlyRemoveMarkers) {
     return MFI->getObjectSize(LHS) > MFI->getObjectSize(RHS);
   });
 
+  unsigned NumActiveSlots = NumSlots;
+  while (NumActiveSlots > 0 && SortedSlots[NumActiveSlots - 1] == -1)
+    --NumActiveSlots;
+
   for (auto &s : LiveStarts)
     llvm::sort(s);
 
-  bool Changed = true;
-  while (Changed) {
-    Changed = false;
-    for (unsigned I = 0; I < NumSlots; ++I) {
-      if (SortedSlots[I] == -1)
+  // Merging slots only grows their live intervals and LiveStarts sets, so any
+  // pair that overlaps on the first pass can never become disjoint later.
+  // A single pass over (I, J) finds all possible greedy merges.
+  for (unsigned I = 0; I < NumActiveSlots; ++I) {
+    int FirstSlot = SortedSlots[I];
+    if (FirstSlot == -1)
+      continue;
+
+    uint8_t FirstStackID = MFI->getStackID(FirstSlot);
+    LiveInterval *First = &*Intervals[FirstSlot];
+    auto &FirstS = LiveStarts[FirstSlot];
+
+    for (unsigned J = I + 1; J < NumActiveSlots; ++J) {
+      int SecondSlot = SortedSlots[J];
+      if (SecondSlot == -1)
         continue;
 
-      for (unsigned J=I+1; J < NumSlots; ++J) {
-        if (SortedSlots[J] == -1)
-          continue;
+      // Objects with different stack IDs cannot be merged.
+      if (FirstStackID != MFI->getStackID(SecondSlot))
+        continue;
 
-        int FirstSlot = SortedSlots[I];
-        int SecondSlot = SortedSlots[J];
+      LiveInterval *Second = &*Intervals[SecondSlot];
+      auto &SecondS = LiveStarts[SecondSlot];
+      assert(!First->empty() && !Second->empty() && "Found an empty range");
 
-        // Objects with different stack IDs cannot be merged.
-        if (MFI->getStackID(FirstSlot) != MFI->getStackID(SecondSlot))
-          continue;
+      // Merge disjoint slots. This is a little bit tricky - see the
+      // Implementation Notes section for an explanation.
+      if (!First->isLiveAtIndexes(SecondS) &&
+          !Second->isLiveAtIndexes(FirstS)) {
+        First->MergeSegmentsInAsValue(*Second, First->getValNumInfo(0));
 
-        LiveInterval *First = &*Intervals[FirstSlot];
-        LiveInterval *Second = &*Intervals[SecondSlot];
-        auto &FirstS = LiveStarts[FirstSlot];
-        auto &SecondS = LiveStarts[SecondSlot];
-        assert(!First->empty() && !Second->empty() && "Found an empty range");
+        int OldSize = FirstS.size();
+        FirstS.append(SecondS.begin(), SecondS.end());
+        auto Mid = FirstS.begin() + OldSize;
+        std::inplace_merge(FirstS.begin(), Mid, FirstS.end());
 
-        // Merge disjoint slots. This is a little bit tricky - see the
-        // Implementation Notes section for an explanation.
-        if (!First->isLiveAtIndexes(SecondS) &&
-            !Second->isLiveAtIndexes(FirstS)) {
-          Changed = true;
-          First->MergeSegmentsInAsValue(*Second, First->getValNumInfo(0));
+        SlotRemap[SecondSlot] = FirstSlot;
+        SortedSlots[J] = -1;
+        LLVM_DEBUG(dbgs() << "Merging #" << FirstSlot << " and slots #"
+                          << SecondSlot << " together.\n");
+        Align MaxAlignment = std::max(MFI->getObjectAlign(FirstSlot),
+                                      MFI->getObjectAlign(SecondSlot));
 
-          int OldSize = FirstS.size();
-          FirstS.append(SecondS.begin(), SecondS.end());
-          auto Mid = FirstS.begin() + OldSize;
-          std::inplace_merge(FirstS.begin(), Mid, FirstS.end());
+        assert(MFI->getObjectSize(FirstSlot) >=
+                   MFI->getObjectSize(SecondSlot) &&
+               "Merging a small object into a larger one");
 
-          SlotRemap[SecondSlot] = FirstSlot;
-          SortedSlots[J] = -1;
-          LLVM_DEBUG(dbgs() << "Merging #" << FirstSlot << " and slots #"
-                            << SecondSlot << " together.\n");
-          Align MaxAlignment = std::max(MFI->getObjectAlign(FirstSlot),
-                                        MFI->getObjectAlign(SecondSlot));
-
-          assert(MFI->getObjectSize(FirstSlot) >=
-                 MFI->getObjectSize(SecondSlot) &&
-                 "Merging a small object into a larger one");
-
-          RemovedSlots+=1;
-          ReducedSize += MFI->getObjectSize(SecondSlot);
-          MFI->setObjectAlignment(FirstSlot, MaxAlignment);
-          MFI->RemoveStackObject(SecondSlot);
-        }
+        RemovedSlots += 1;
+        ReducedSize += MFI->getObjectSize(SecondSlot);
+        MFI->setObjectAlignment(FirstSlot, MaxAlignment);
+        MFI->RemoveStackObject(SecondSlot);
       }
     }
-  }// While changed.
+  }
 
   // Record statistics.
   StackSpaceSaved += ReducedSize;
