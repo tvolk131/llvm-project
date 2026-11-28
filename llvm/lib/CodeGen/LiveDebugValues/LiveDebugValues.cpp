@@ -14,6 +14,8 @@
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/InitializePasses.h"
 #include "llvm/Pass.h"
@@ -82,13 +84,11 @@ public:
 };
 
 struct LiveDebugValues {
-  LiveDebugValues();
+  LiveDebugValues() = default;
   ~LiveDebugValues() = default;
   bool run(MachineFunction &MF, bool ShouldEmitDebugEntryValues);
 
 private:
-  std::unique_ptr<LDVImpl> InstrRefImpl;
-  std::unique_ptr<LDVImpl> VarLocImpl;
   MachineDominatorTree MDT;
 };
 } // namespace
@@ -102,12 +102,6 @@ INITIALIZE_PASS(LiveDebugValuesLegacy, DEBUG_TYPE, "Live DEBUG_VALUE analysis",
 
 /// Default construct and initialize the pass.
 LiveDebugValuesLegacy::LiveDebugValuesLegacy() : MachineFunctionPass(ID) {}
-
-LiveDebugValues::LiveDebugValues() {
-  InstrRefImpl =
-      std::unique_ptr<LDVImpl>(llvm::makeInstrRefBasedLiveDebugValues());
-  VarLocImpl = std::unique_ptr<LDVImpl>(llvm::makeVarLocBasedLiveDebugValues());
-}
 
 PreservedAnalyses
 LiveDebugValuesPass::run(MachineFunction &MF,
@@ -133,17 +127,33 @@ bool LiveDebugValuesLegacy::runOnMachineFunction(MachineFunction &MF) {
 
 bool LiveDebugValues::run(MachineFunction &MF,
                           bool ShouldEmitDebugEntryValues) {
-  bool InstrRefBased = MF.useDebugInstrRef();
-  // Allow the user to force selection of InstrRef LDV.
-  InstrRefBased |= ForceInstrRefLDV;
+  const DISubprogram *SP = MF.getFunction().getSubprogram();
+  if (!SP)
+    return false;
 
-  LDVImpl *TheImpl = &*VarLocImpl;
+  bool InstrRefBased = MF.useDebugInstrRef() || ForceInstrRefLDV;
+  if (!InstrRefBased && SP->getUnit() &&
+      SP->getUnit()->getEmissionKind() == DICompileUnit::NoDebug)
+    return false;
 
+  // Skip MDT/LexicalScopes/dataflow setup when there are no debug value or
+  // debug PHI instructions to extend or resolve.
+  bool HasDebugValueOrPHI = llvm::any_of(MF, [](const MachineBasicBlock &MBB) {
+    return llvm::any_of(MBB.instrs(), [](const MachineInstr &MI) {
+      return MI.isDebugValueLike() || MI.isDebugPHI();
+    });
+  });
+  if (!HasDebugValueOrPHI)
+    return false;
+
+  std::unique_ptr<LDVImpl> TheImpl;
   MachineDominatorTree *DomTree = nullptr;
   if (InstrRefBased) {
     DomTree = &MDT;
     MDT.recalculate(MF);
-    TheImpl = &*InstrRefImpl;
+    TheImpl.reset(llvm::makeInstrRefBasedLiveDebugValues());
+  } else {
+    TheImpl.reset(llvm::makeVarLocBasedLiveDebugValues());
   }
 
   return TheImpl->ExtendRanges(MF, DomTree, ShouldEmitDebugEntryValues,
