@@ -50,13 +50,20 @@ class X86FastISel final : public FastISel {
   /// make the right decision when generating code for different targets.
   const X86Subtarget *Subtarget;
 
+  /// True if the module enables 64-bit import call optimization, which
+  /// X86FastISel does not handle.
+  const bool HasImportCallOpt;
+
 public:
   explicit X86FastISel(FunctionLoweringInfo &funcInfo,
                        const TargetLibraryInfo *libInfo,
                        const LibcallLoweringInfo *libcallLowering)
-      : FastISel(funcInfo, libInfo, libcallLowering) {
-    Subtarget = &funcInfo.MF->getSubtarget<X86Subtarget>();
-  }
+      : FastISel(funcInfo, libInfo, libcallLowering),
+        Subtarget(&funcInfo.MF->getSubtarget<X86Subtarget>()),
+        HasImportCallOpt(
+            Subtarget->is64Bit() &&
+            funcInfo.MF->getFunction().getParent()->getModuleFlag(
+                "import-call-optimization")) {}
 
   bool fastSelectInstruction(const Instruction *I) override;
 
@@ -3444,8 +3451,7 @@ bool X86FastISel::fastLowerCall(CallLoweringInfo &CLI) {
       return false;
 
   // Can't handle import call optimization.
-  if (Is64Bit &&
-      MF->getFunction().getParent()->getModuleFlag("import-call-optimization"))
+  if (HasImportCallOpt)
     return false;
 
   SmallVector<MVT, 16> OutVTs;
